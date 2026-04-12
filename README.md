@@ -2,7 +2,8 @@
 
 基于 Cloudflare Workers + D1 数据库构建的**现代化、零探针 (Agentless)、高颜值**的服务与网站在线状态监控面板。
 
-![Status Monitor Demo](https://via.placeholder.com/1200x600.png?text=Status+Monitor+Dashboard+Screenshot)
+!()[/demopic/01.png]
+
 
 ## ✨ 核心功能特性
 
