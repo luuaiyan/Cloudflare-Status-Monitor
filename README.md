@@ -57,11 +57,13 @@
 
 ### 第三步：配置环境变量 (必须！！！)
 在 Worker 的 **设置** -> **变量和机密** 中，你可以配置以下参数增强安全性（建议配置）：
-* `USERNAME`: 自定义后台账号
+* `USERNAME`: 自定义后台账号 
 * `PASSWORD`: 自定义后台密码
 * `JWT_SECRET`: 长且复杂的随机字符串。(例如：`a8f9c2e4b6fasdfd7f1ag3dc5e8bdsagasfg0d4f2a9c7e1`，或者在键盘上乱敲一段英文字母+数字的组合，越长越好)
 * `LOGIN`（可选）: 默认为`https://你的域名/login.html` ，自定义私密登录后缀（例如填写 `admin-panel`，则后台地址变为 `https://你的域名/admin-panel`）
 
+> 建议：`USERNAME`选择 `Text` ，`PASSWORD` 选择 `Secret`，`JWT_SECRET` 选择 `Secret`
+ 
 ### 第四步： 设置定时
 在 Worker 的 **设置** -> **触发事件** 中，添加一个 **Cron 触发器**，一般建议30分钟或者1h触发一次。
 
