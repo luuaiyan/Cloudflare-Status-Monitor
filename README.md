@@ -2,6 +2,8 @@
 
 基于 Cloudflare Workers + D1 数据库构建的**现代化、零探针 (Agentless)、高颜值**的服务与网站在线状态监控面板。
 
+网址Demo：<https://status.allen99.dpdns.org>
+
 ![](/demopic/v2.0.0/v2.0.0-light.png)
 
 ![](/demopic/v2.0.0/v2.0.0-dark.png)
