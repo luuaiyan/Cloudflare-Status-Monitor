@@ -175,45 +175,57 @@ async function ensureTablesExist(db, env) {
 }
 
 // ==================== 探测逻辑 ====================
-async function checkTcpPort(host, port, timeoutMs = 5000) {
-  const start = Date.now();
-  try {
-    const socket = connect({ hostname: host, port: parseInt(port) });
-    const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), timeoutMs));
-    await Promise.race([socket.opened, timeoutPromise]);
-    const latency = Date.now() - start;
-    socket.close();
-    return { status: 'UP', latency };
-  } catch (e) {
-    return { status: 'DOWN', latency: Date.now() - start };
+async function checkTcpPort(host, port, timeoutMs = 8000, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    const start = Date.now();
+    try {
+      const socket = connect({ hostname: host, port: parseInt(port) });
+      const timeoutPromise = new Promise((_, reject) => setTimeout(() => reject(new Error('Timeout')), timeoutMs));
+      await Promise.race([socket.opened, timeoutPromise]);
+      const latency = Date.now() - start;
+      socket.close();
+      return { status: 'UP', latency };
+    } catch (e) {
+      if (i === retries) return { status: 'DOWN', latency: Date.now() - start };
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
   }
 }
 
-async function checkHttpAdvanced(url, method, headers, bodyStr, timeoutMs = 10000) {
-  const start = Date.now();
-  try {
-    const reqMethod = method || 'HEAD';
-    const options = { method: reqMethod, redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) };
-    if (headers) { try { options.headers = JSON.parse(headers); } catch(e){} }
-    if (bodyStr && ['POST','PUT','PATCH'].includes(reqMethod)) { options.body = bodyStr; }
+async function checkHttpAdvanced(url, method, headers, bodyStr, timeoutMs = 10000, retries = 2) {
+  for (let i = 0; i <= retries; i++) {
+    const start = Date.now();
+    try {
+      const reqMethod = method || 'HEAD';
+      const options = { method: reqMethod, redirect: 'follow', signal: AbortSignal.timeout(timeoutMs) };
+      if (headers) { try { options.headers = JSON.parse(headers); } catch(e){} }
+      if (bodyStr && ['POST','PUT','PATCH'].includes(reqMethod)) { options.body = bodyStr; }
 
-    const response = await fetch(url, options);
-    const latency = Date.now() - start;
-    const isUp = response.ok || (response.status >= 300 && response.status < 500);
-    return { status: isUp ? 'UP' : 'DOWN', statusCode: response.status, latency };
-  } catch (e) {
-    return { status: e.name === 'TimeoutError' ? 'TIMEOUT' : 'ERROR', statusCode: null, latency: Date.now() - start };
+      const response = await fetch(url, options);
+      const latency = Date.now() - start;
+      const isUp = response.ok || (response.status >= 300 && response.status < 500);
+      
+      if (isUp) return { status: 'UP', statusCode: response.status, latency };
+      
+      if (i === retries) return { status: 'DOWN', statusCode: response.status, latency };
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    } catch (e) {
+      if (i === retries) {
+          return { status: e.name === 'TimeoutError' ? 'TIMEOUT' : 'ERROR', statusCode: null, latency: Date.now() - start };
+      }
+      await new Promise(resolve => setTimeout(resolve, 1000));
+    }
   }
 }
 
-async function sendBarkNotification(db, message) {
+async function sendBarkNotification(db, title, message, group = "StatusMonitor") {
   try {
     const cfg = await configCache.getBarkConfig(db);
     if (!cfg?.enable_notifications || !cfg.bark_url) return;
     await fetch(cfg.bark_url.trim(), { 
         method: 'POST', 
         headers: { 'Content-Type': 'application/json; charset=utf-8' }, 
-        body: JSON.stringify({ title: "Status Monitor Alert", body: message, group: "StatusMonitor", level: "active" }) 
+        body: JSON.stringify({ title: title, body: message, group: group, level: "active" }) 
     });
   } catch (e) {}
 }
@@ -225,10 +237,10 @@ async function processServerCheck(server, db, ctx) {
   let newNotify = last_notified_down_at;
 
   if (result.status === 'DOWN' && last_status !== 'DOWN') {
-    ctx.waitUntil(sendBarkNotification(db, `🔴 TCP宕机: [${name}] 端口 ${port} 无法连接`));
+    ctx.waitUntil(sendBarkNotification(db, "🔴 TCP 宕机告警", `[${name}] 端口 ${port} 无法连接`, "🖥️ 服务运行状态"));
     newNotify = checkTime;
   } else if (result.status === 'UP' && last_status === 'DOWN') {
-    ctx.waitUntil(sendBarkNotification(db, `✅ TCP恢复: [${name}] 已重新上线`));
+    ctx.waitUntil(sendBarkNotification(db, "✅ TCP 恢复通知", `[${name}] 已重新上线`, "🖥️ 服务运行状态"));
     newNotify = null;
   }
 
@@ -245,10 +257,10 @@ async function processSiteCheck(site, db, ctx) {
   let newNotify = last_notified_down_at;
 
   if (['DOWN', 'TIMEOUT', 'ERROR'].includes(result.status) && !['DOWN', 'TIMEOUT', 'ERROR'].includes(last_status)) {
-    ctx.waitUntil(sendBarkNotification(db, `🔴 HTTP宕机: [${name || url}] 状态 ${result.status} (${result.statusCode || '-'})`));
+    ctx.waitUntil(sendBarkNotification(db, "🔴 HTTP 宕机告警", `[${name || url}] 状态 ${result.status} (${result.statusCode || '-'})`, "🌐 网站访问状态"));
     newNotify = checkTime;
   } else if (result.status === 'UP' && ['DOWN', 'TIMEOUT', 'ERROR'].includes(last_status)) {
-    ctx.waitUntil(sendBarkNotification(db, `✅ HTTP恢复: [${name || url}] 已重新连通`));
+    ctx.waitUntil(sendBarkNotification(db, "✅ HTTP 恢复通知", `[${name || url}] 已重新连通`, "🌐 网站访问状态"));
     newNotify = null;
   }
 
@@ -390,7 +402,6 @@ async function handleApiRequest(request, env, ctx) {
       return createSuccessResponse({}, corsHeaders);
     }
     
-    // Bark Push Test API
     if (path === '/api/admin/bark-settings/test' && method === 'POST') {
       const { bark_url } = await parseJsonSafely(request);
       if (!bark_url) return createErrorResponse('Error', 'Bark URL is empty', 400, corsHeaders);
@@ -444,8 +455,8 @@ function handleFrontendRequest(request, path, env) {
     [loginRoute]: () => new Response(getLoginHtml(), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } }),
     '/admin.html': () => new Response(getAdminHtml(), { headers: { 'Content-Type': 'text/html;charset=UTF-8' } }),
     '/css/style.css': () => new Response(getStyleCss(), { headers: { 'Content-Type': 'text/css;charset=UTF-8' } }),
-    '/js/main.js': () => new Response(getMainJs(), { headers: { 'Content-Type': 'application/javascript;charset=UTF-8' } }),
-    '/js/admin.js': () => new Response(getAdminJs(), { headers: { 'Content-Type': 'application/javascript;charset=UTF-8' } }),
+    '/js/main.js': () => new Response(getSharedJs() + getMainJs(), { headers: { 'Content-Type': 'application/javascript;charset=UTF-8' } }),
+    '/js/admin.js': () => new Response(getSharedJs() + getAdminJs(), { headers: { 'Content-Type': 'application/javascript;charset=UTF-8' } }),
     '/favicon.svg': () => new Response(getFaviconSvg(), { headers: { 'Content-Type': 'image/svg+xml' } })
   };
   return routes[path] ? routes[path]() : new Response('Not Found', { status: 404 });
@@ -504,6 +515,61 @@ function getFaviconSvg() {
 }
 
 // ==================== 前端模板 ====================
+function getThemeScript() {
+  return `
+    <script>
+      (function(){
+        let t = localStorage.getItem('vps-monitor-theme') || 'auto';
+        let actual = t;
+        if(t === 'auto') {
+            actual = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        document.documentElement.setAttribute('data-bs-theme', actual);
+      })();
+    </script>
+  `;
+}
+
+function getHeaderControls() {
+  return `
+    <div class="d-flex align-items-center gap-2 flex-nowrap" id="navButtonGroup">
+        <div class="nav-control-card d-flex align-items-center px-2 px-sm-3 py-1">
+            <i class="fa-solid fa-language text-muted me-1 me-sm-2"></i>
+            <span class="text-muted small fw-bold me-1 me-sm-2 d-none d-sm-block" data-i18n="lang">语言</span>
+            <select id="langSelect" class="form-select form-select-sm border-0 bg-transparent shadow-none fw-bold" style="width: auto; cursor: pointer; padding-left: 0.5rem; padding-right: 1.8rem;">
+                <option value="zh">简体中文</option>
+                <option value="en">English</option>
+            </select>
+        </div>
+        <div class="nav-control-card d-flex align-items-center px-2 px-sm-3 py-1">
+            <i class="fa-solid fa-circle-half-stroke text-muted me-1 me-sm-2"></i>
+            <span class="text-muted small fw-bold me-1 me-sm-2 d-none d-sm-block" data-i18n="theme">外观</span>
+            <select id="themeSelect" class="form-select form-select-sm border-0 bg-transparent shadow-none fw-bold" style="width: auto; cursor: pointer; padding-left: 0.5rem; padding-right: 1.8rem;">
+                <option value="auto" data-i18n="theme_auto">自动</option>
+                <option value="light" data-i18n="theme_light">浅色</option>
+                <option value="dark" data-i18n="theme_dark">深色</option>
+            </select>
+        </div>
+    </div>
+  `;
+}
+
+function getFooterHtml() {
+  return `
+    <footer class="footer py-4 mt-auto border-top footer-border">
+        <div class="container d-flex flex-column flex-md-row justify-content-between align-items-center gap-3">
+            <div class="d-flex align-items-center gap-2">
+                <div class="status-indicator-pulse"></div>
+                <span class="text-muted small fw-bold tracking-tight" data-i18n="all_ok">所有系统运行正常</span>
+            </div>
+            <div class="text-muted small fw-medium">
+                &copy; 2026 Status Monitor <span class="mx-2 opacity-25">|</span> Powered by Allen
+            </div>
+        </div>
+    </footer>
+  `;
+}
+
 function getIndexHtml(loginRoute) {
   return `<!DOCTYPE html>
 <html lang="zh-CN">
@@ -514,66 +580,47 @@ function getIndexHtml(loginRoute) {
     <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/echarts@5.5.0/dist/echarts.min.js"></script>
-    <script>
-      (function(){
-        let t = localStorage.getItem('vps-monitor-theme');
-        if(!t) {
-            const h = new Date().getHours();
-            t = (h < 6 || h >= 18) ? 'dark' : 'light';
-            localStorage.setItem('vps-monitor-theme', t);
-        }
-        document.documentElement.setAttribute('data-bs-theme', t);
-      })();
-    </script>
+    ${getThemeScript()}
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet">
     <link href="/css/style.css" rel="stylesheet">
 </head>
 <body class="d-flex flex-column min-vh-100">
+    <div class="ambient-glow"></div>
     <div id="toastContainer" class="toast-container"></div>
     <nav class="navbar custom-glass-nav sticky-top">
         <div class="container-fluid px-4 px-md-5 w-80">
             <a class="navbar-brand d-flex align-items-center gap-2 m-0 text-decoration-none" href="/">
                 <img src="/favicon.svg" width="28" height="28" alt="Logo">
-                <span class="text-white fw-bold fs-5 tracking-tight">Status Monitor</span>
+                <span class="text-body fw-bold fs-5 tracking-tight">Status Monitor</span>
             </a>
-            <div class="d-flex align-items-center gap-2 flex-nowrap" id="navButtonGroup">
-                <button id="themeToggler" class="btn nav-action-btn border-0"><i class="bi bi-moon-stars-fill fs-5"></i></button>
-            </div>
+            ${getHeaderControls()}
         </div>
     </nav>
-    <div class="container-fluid px-4 px-md-5 mt-4 mt-md-5 mb-5 flex-grow-1 w-80">
-        <div class="card border-0 shadow-sm main-card">
-            <div class="card-body p-3 p-md-5">
-                <div class="mb-5">
-                    <h5 class="card-title mb-4 fw-bold d-flex align-items-center px-2 px-md-0"><i class="bi bi-hdd-network me-2 text-primary fs-4"></i>Services</h5>
-                    <div class="table-responsive d-none d-md-block">
-                        <table class="table align-middle custom-table public-status-table">
-                            <thead><tr><th>名称</th><th>状态</th><th>连通率</th><th>延迟</th><th>最后检查</th><th>24h趋势</th></tr></thead>
-                            <tbody id="serverTableBody"><tr><td colspan="6" class="text-center text-muted py-5">Connecting...</td></tr></tbody>
-                        </table>
-                    </div>
-                    <div id="mobileServerContainer" class="d-block d-md-none"></div>
-                </div>
-                <hr class="my-5 border-secondary opacity-10">
-                <div class="mb-3">
-                    <h5 class="card-title mb-4 fw-bold d-flex align-items-center px-2 px-md-0"><i class="bi bi-globe me-2 text-success fs-4"></i>Websites</h5>
-                    <div class="table-responsive d-none d-md-block">
-                        <table class="table align-middle custom-table public-status-table">
-                            <thead><tr><th>名称</th><th>状态</th><th>连通率</th><th>延迟</th><th>最后检查</th><th>24h趋势</th></tr></thead>
-                            <tbody id="siteStatusTableBody"><tr><td colspan="6" class="text-center text-muted py-5">Connecting...</td></tr></tbody>
-                        </table>
-                    </div>
-                    <div id="mobileSiteContainer" class="d-block d-md-none"></div>
-                </div>
+    <div class="container-fluid px-4 px-md-5 mt-4 mt-md-5 mb-5 flex-grow-1 w-80 position-relative z-1">
+        
+        <div class="status-card-parent p-3 p-md-4 mb-4">
+            <h5 class="mb-3 fw-bold d-flex align-items-center">
+                <i class="fa-solid fa-server me-2 text-primary"></i><span data-i18n="services">服务状态</span>
+            </h5>
+            <div id="serverGrid" class="row row-cols-1 row-cols-lg-2 g-3">
+                <div class="col-12 text-center text-muted py-5" data-i18n="connecting">连接中...</div>
             </div>
         </div>
+        
+        <div class="status-card-parent p-3 p-md-4 mb-4">
+            <h5 class="mb-3 fw-bold d-flex align-items-center">
+                <i class="fa-solid fa-globe me-2 text-success"></i><span data-i18n="websites">网站访问</span>
+            </h5>
+            <div id="siteGrid" class="row row-cols-1 row-cols-lg-2 g-3">
+                <div class="col-12 text-center text-muted py-5" data-i18n="connecting">连接中...</div>
+            </div>
+        </div>
+        
     </div>
-    <footer class="footer py-4 mt-auto glass-footer">
-        <div class="container text-center"><span class="text-muted small fw-medium">Power by Allen &copy; 2026 &middot; Status Monitor</span></div>
-    </footer>
+    ${getFooterHtml()}
     <script src="/js/main.js"></script>
 </body>
 </html>`;
@@ -589,59 +636,46 @@ function getLoginHtml() {
     <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
-    <script>
-      (function(){
-        let t = localStorage.getItem('vps-monitor-theme');
-        if(!t) {
-            const h = new Date().getHours();
-            t = (h < 6 || h >= 18) ? 'dark' : 'light';
-            localStorage.setItem('vps-monitor-theme', t);
-        }
-        document.documentElement.setAttribute('data-bs-theme', t);
-      })();
-    </script>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
+    ${getThemeScript()}
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet">
     <link href="/css/style.css" rel="stylesheet">
 </head>
 <body class="d-flex flex-column min-vh-100">
+    <div class="ambient-glow"></div>
     <div id="toastContainer" class="toast-container"></div>
     <nav class="navbar custom-glass-nav sticky-top">
         <div class="container-fluid px-4 px-md-5 w-80">
             <a class="navbar-brand d-flex align-items-center gap-2 m-0 text-decoration-none" href="/">
                 <img src="/favicon.svg" width="28" height="28" alt="Logo">
-                <span class="text-white fw-bold fs-5 tracking-tight">Status Monitor</span>
+                <span class="text-body fw-bold fs-5 tracking-tight">Status Monitor</span>
             </a>
             <div class="d-flex align-items-center gap-2 flex-nowrap" id="navButtonGroup">
-                <a class="btn nav-action-btn border-0 text-decoration-none" href="/" title="返回首页"><i class="bi bi-house fs-5"></i></a>
-                <button id="themeToggler" class="btn nav-action-btn border-0"><i class="bi bi-moon-stars-fill fs-5"></i></button>
+                <a class="nav-control-card d-flex align-items-center px-3 text-decoration-none" href="/" title="Home"><i class="fa-solid fa-house text-muted"></i></a>
+                ${getHeaderControls()}
             </div>
         </div>
     </nav>
-    <div class="container d-flex flex-column justify-content-center align-items-center flex-grow-1" style="padding: 20px 0;">
+    <div class="container d-flex flex-column justify-content-center align-items-center flex-grow-1 position-relative z-1" style="padding: 20px 0;">
         <div class="col-11 col-md-6 col-lg-4">
-            <div class="card border-0 shadow-lg main-card" style="border-radius: 24px;">
-                <div class="card-body p-4 p-md-5">
-                    <h4 class="fw-bold mb-4 text-center">Admin Login</h4>
-                    <form id="loginForm">
-                        <div class="mb-3">
-                            <input type="text" name="username" autocomplete="username" class="form-control bg-light-subtle border-0 rounded-4 px-4 py-3 fs-6" id="username" placeholder="Username" required>
-                        </div>
-                        <div class="mb-4">
-                            <input type="password" name="password" autocomplete="current-password" class="form-control bg-light-subtle border-0 rounded-4 px-4 py-3 fs-6" id="password" placeholder="Password" required>
-                        </div>
-                        <div class="d-grid mt-4">
-                            <button type="submit" class="btn btn-primary rounded-4 fw-bold shadow-sm py-3 fs-6">Access Dashboard</button>
-                        </div>
-                    </form>
-                </div>
+            <div class="status-card-child border-0 p-4 p-md-5 shadow-lg" style="border-radius: 20px; --theme-hue: 59, 130, 246;">
+                <h4 class="fw-bold mb-4 text-center" data-i18n="admin_login">管理员登录</h4>
+                <form id="loginForm">
+                    <div class="mb-3">
+                        <input type="text" name="username" autocomplete="username" class="form-control bg-light-subtle border-0 rounded-4 px-4 py-3 fs-6" id="username" data-i18n-placeholder="username" placeholder="Username" required>
+                    </div>
+                    <div class="mb-4">
+                        <input type="password" name="password" autocomplete="current-password" class="form-control bg-light-subtle border-0 rounded-4 px-4 py-3 fs-6" id="password" data-i18n-placeholder="pwd" placeholder="Password" required>
+                    </div>
+                    <div class="d-grid mt-4">
+                        <button type="submit" class="btn btn-primary rounded-4 fw-bold shadow-sm py-3 fs-6" data-i18n="login_btn">进入控制面板</button>
+                    </div>
+                </form>
             </div>
         </div>
     </div>
-    <footer class="footer py-4 mt-auto glass-footer">
-        <div class="container text-center"><span class="text-muted small fw-medium">Power by Allen &copy; 2026 &middot; Status Monitor</span></div>
-    </footer>
+    ${getFooterHtml()}
     <script src="/js/main.js"></script>
 </body>
 </html>`;
@@ -657,111 +691,97 @@ function getAdminHtml() {
     <link rel="icon" type="image/svg+xml" href="/favicon.svg">
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;700&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
     <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/js/bootstrap.bundle.min.js"></script>
-    <script>
-      (function(){
-        let t = localStorage.getItem('vps-monitor-theme');
-        if(!t) {
-            const h = new Date().getHours();
-            t = (h < 6 || h >= 18) ? 'dark' : 'light';
-            localStorage.setItem('vps-monitor-theme', t);
-        }
-        document.documentElement.setAttribute('data-bs-theme', t);
-      })();
-    </script>
+    ${getThemeScript()}
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet">
     <link href="/css/style.css" rel="stylesheet">
 </head>
 <body class="d-flex flex-column min-vh-100">
+    <div class="ambient-glow"></div>
     <div id="toastContainer" class="toast-container"></div>
     <nav class="navbar custom-glass-nav sticky-top">
         <div class="container-fluid px-4 px-md-5 w-80">
             <a class="navbar-brand d-flex align-items-center gap-2 m-0 text-decoration-none" href="/">
                 <img src="/favicon.svg" width="28" height="28" alt="Logo">
-                <span class="text-white fw-bold fs-5 tracking-tight d-none d-sm-inline">Status Monitor</span>
+                <span class="text-body fw-bold fs-5 tracking-tight d-none d-sm-inline">Status Monitor</span>
             </a>
             <div class="d-flex align-items-center gap-2 flex-nowrap" id="navButtonGroup" style="white-space: nowrap;">
-                <a class="btn nav-action-btn border-0 text-decoration-none" href="/" title="返回首页"><i class="bi bi-house fs-5"></i></a>
-                <button id="themeToggler" class="btn nav-action-btn border-0"><i class="bi bi-moon-stars-fill fs-5"></i></button>
-                <button id="logoutBtn" class="btn bg-white text-primary rounded-pill px-3 px-sm-4 fw-bold shadow-sm ms-1 ms-sm-2" style="height: 38px; font-size: 0.9rem;">Logout</button>
+                <a class="nav-control-card d-flex align-items-center px-3 text-decoration-none" href="/" title="Home"><i class="fa-solid fa-house text-muted"></i></a>
+                <div class="d-none d-md-flex">${getHeaderControls()}</div>
+                <button id="logoutBtn" class="btn btn-primary rounded-pill px-3 px-sm-4 fw-bold shadow-sm ms-1 ms-sm-2" style="height: 38px; font-size: 0.9rem;"><i class="fa-solid fa-arrow-right-from-bracket"></i></button>
             </div>
         </div>
     </nav>
-    <div class="container-fluid px-4 px-md-5 mt-4 mt-md-5 mb-5 flex-grow-1 w-80">
-        <div class="card border-0 shadow-sm main-card">
-            <div class="card-body p-3 p-md-5">
-                <div class="mb-5">
-                    <div class="d-flex justify-content-between align-items-center mb-4 px-2 px-md-0">
-                        <h5 class="fw-bold mb-0 fs-5"><i class="bi bi-hdd-network me-2 text-primary fs-4"></i>Services</h5>
-                        <button class="btn btn-primary rounded-pill px-3 px-sm-4 fw-bold shadow-sm" onclick="showServerModal()"><i class="bi bi-plus-lg me-1"></i> Add Target</button>
-                    </div>
-                    <div class="table-responsive">
-                        <table class="table align-middle custom-table admin-status-table">
-                            <thead><tr><th></th><th>名称</th><th>Host:Port</th><th>状态</th><th>公开展示</th><th>操作</th></tr></thead>
-                            <tbody id="adminServerTableBody"></tbody>
-                        </table>
-                    </div>
+    <div class="container-fluid px-4 px-md-5 mt-4 mt-md-5 mb-5 flex-grow-1 w-80 position-relative z-1">
+        
+        <div class="status-card-parent p-3 p-md-4 mb-4">
+            <div class="d-flex justify-content-between align-items-center mb-3 px-2 px-md-0">
+                <h5 class="fw-bold mb-0 fs-5"><i class="fa-solid fa-server me-2 text-primary"></i><span data-i18n="services">服务状态</span></h5>
+                <button class="btn btn-primary rounded-pill px-3 px-sm-4 fw-bold shadow-sm" onclick="showServerModal()"><i class="fa-solid fa-plus me-1"></i> <span data-i18n="add_target">添加</span></button>
+            </div>
+            <div class="status-card-child" style="--theme-hue: 59, 130, 246;">
+                <div class="table-responsive">
+                    <table class="table align-middle custom-table admin-status-table mb-0">
+                        <thead><tr><th></th><th data-i18n="th_name">名称</th><th data-i18n="host_port">地址:端口</th><th data-i18n="status">状态</th><th data-i18n="public">公开展示</th><th data-i18n="action">操作</th></tr></thead>
+                        <tbody id="adminServerTableBody"></tbody>
+                    </table>
                 </div>
-                
-                <hr class="my-5 border-secondary opacity-10">
-                
-                <div class="mb-5">
-                    <div class="d-flex justify-content-between align-items-center mb-4 px-2 px-md-0">
-                        <h5 class="fw-bold mb-0 fs-5"><i class="bi bi-globe me-2 text-success fs-4"></i>Websites</h5>
-                        <button class="btn btn-success rounded-pill px-3 px-sm-4 fw-bold shadow-sm" onclick="showSiteModal()"><i class="bi bi-plus-lg me-1"></i> Add Monitor</button>
-                    </div>
-                    <div class="table-responsive">
-                        <table class="table align-middle custom-table admin-status-table">
-                            <thead><tr><th></th><th>名称</th><th>HTTP 请求详情</th><th>状态</th><th>公开展示</th><th>操作</th></tr></thead>
-                            <tbody id="adminSiteTableBody"></tbody>
-                        </table>
-                    </div>
+            </div>
+        </div>
+        
+        <div class="status-card-parent p-3 p-md-4 mb-4">
+            <div class="d-flex justify-content-between align-items-center mb-3 px-2 px-md-0">
+                <h5 class="fw-bold mb-0 fs-5"><i class="fa-solid fa-globe me-2 text-success"></i><span data-i18n="websites">网站访问</span></h5>
+                <button class="btn btn-success rounded-pill px-3 px-sm-4 fw-bold shadow-sm" onclick="showSiteModal()"><i class="fa-solid fa-plus me-1"></i> <span data-i18n="add_site">添加</span></button>
+            </div>
+            <div class="status-card-child" style="--theme-hue: 16, 185, 129;">
+                <div class="table-responsive">
+                    <table class="table align-middle custom-table admin-status-table mb-0">
+                        <thead><tr><th></th><th data-i18n="th_name">名称</th><th>URL</th><th data-i18n="status">状态</th><th data-i18n="public">公开展示</th><th data-i18n="action">操作</th></tr></thead>
+                        <tbody id="adminSiteTableBody"></tbody>
+                    </table>
                 </div>
-                
-                <hr class="my-5 border-secondary opacity-10">
-                
-                <div class="row g-4">
-                    <div class="col-md-6">
-                        <div class="bg-light-subtle p-4 p-md-5 rounded-4 h-100 border-0 shadow-sm">
-                            <h5 class="fw-bold mb-4"><i class="bi bi-bell-fill me-2 text-danger"></i>Bark Push Notify</h5>
-                            <form id="barkForm">
-                                <div class="mb-4">
-                                    <label class="form-label text-muted small fw-bold text-uppercase">Bark API URL</label>
-                                    <input type="url" class="form-control form-control-lg border-0 rounded-3 bg-body" id="barkUrl" placeholder="https://api.day.app/YourKey">
-                                </div>
-                                <div class="form-check form-switch mb-4">
-                                    <input class="form-check-input" type="checkbox" id="enableBark">
-                                    <label class="form-check-label fw-medium" for="enableBark">Enable Real-time Push</label>
-                                </div>
-                                <div class="d-flex gap-2">
-                                    <button type="button" onclick="saveBark()" class="btn btn-dark rounded-pill px-4 py-2 fw-bold flex-grow-1">Save Settings</button>
-                                    <button type="button" onclick="testBark()" class="btn btn-outline-primary rounded-pill px-4 py-2 fw-bold">Test Push</button>
-                                </div>
-                            </form>
+            </div>
+        </div>
+        
+        <div class="row g-3">
+            <div class="col-md-6">
+                <div class="status-card-parent p-3 p-md-4 h-100">
+                    <h5 class="fw-bold mb-3"><i class="fa-solid fa-bell me-2 text-danger"></i><span data-i18n="bark_title">Bark 推送通知</span></h5>
+                    <form id="barkForm">
+                        <div class="mb-4">
+                            <label class="form-label text-muted small fw-bold text-uppercase" data-i18n="bark_url">Bark API URL</label>
+                            <input type="url" class="form-control form-control-lg border-0 rounded-3 bg-light-subtle" id="barkUrl" placeholder="https://api.day.app/YourKey">
                         </div>
-                    </div>
-                    <div class="col-md-6">
-                        <div class="bg-light-subtle p-4 p-md-5 rounded-4 h-100 border-0 shadow-sm">
-                            <h5 class="fw-bold mb-4"><i class="bi bi-database-gear me-2 text-warning"></i>Data Maintenance</h5>
-                            <p class="text-muted small mb-4">Optimizing the database keeps your monitor running fast and within Cloudflare D1 limits.</p>
-                            <div class="d-flex flex-column gap-3">
-                                <div class="p-3 bg-body rounded-3 border border-secondary-subtle d-flex flex-column flex-sm-row justify-content-between align-items-sm-center gap-2">
-                                    <div>
-                                        <h6 class="mb-1 fw-bold fs-6">Clear Old Logs</h6>
-                                        <span class="small text-muted">Delete records older than 24h.</span>
-                                    </div>
-                                    <button onclick="cleanHistory(24)" class="btn btn-sm btn-outline-warning rounded-pill px-4 fw-bold">Clean</button>
-                                </div>
-                                <div class="p-3 bg-body rounded-3 border border-secondary-subtle d-flex flex-column flex-sm-row justify-content-between align-items-sm-center gap-2">
-                                    <div>
-                                        <h6 class="mb-1 fw-bold fs-6">Purge All Logs</h6>
-                                        <span class="small text-muted">Delete all historical records and reset current status.</span>
-                                    </div>
-                                    <button onclick="cleanHistory(0)" class="btn btn-sm btn-outline-danger rounded-pill px-4 fw-bold">Purge</button>
-                                </div>
+                        <div class="form-check form-switch mb-4">
+                            <input class="form-check-input" type="checkbox" id="enableBark">
+                            <label class="form-check-label fw-medium" for="enableBark" data-i18n="enable_push">启用实时推送</label>
+                        </div>
+                        <div class="d-flex gap-2">
+                            <button type="button" onclick="saveBark()" class="btn btn-primary rounded-pill px-4 py-2 fw-bold flex-grow-1" data-i18n="save_settings">保存设置</button>
+                            <button type="button" onclick="testBark()" class="btn btn-outline-secondary rounded-pill px-4 py-2 fw-bold text-body" data-i18n="test_push">测试推送</button>
+                        </div>
+                    </form>
+                </div>
+            </div>
+            <div class="col-md-6">
+                <div class="status-card-parent p-3 p-md-4 h-100">
+                    <h5 class="fw-bold mb-3"><i class="fa-solid fa-database me-2 text-warning"></i><span data-i18n="data_maint">数据维护</span></h5>
+                    <p class="text-muted small mb-3" data-i18n="db_desc">优化数据库以保持监控快速运行，并避免超出 Cloudflare D1 限制。</p>
+                    <div class="d-flex flex-column gap-3">
+                        <div class="p-3 bg-light-subtle rounded-3 border border-secondary-subtle d-flex flex-column flex-sm-row justify-content-between align-items-sm-center gap-2">
+                            <div>
+                                <h6 class="mb-1 fw-bold fs-6" data-i18n="clear_24h">清理 24h 前日志</h6>
                             </div>
+                            <button onclick="cleanHistory(24)" class="btn btn-sm btn-outline-warning rounded-pill px-4 fw-bold" data-i18n="clean">清理</button>
+                        </div>
+                        <div class="p-3 bg-light-subtle rounded-3 border border-secondary-subtle d-flex flex-column flex-sm-row justify-content-between align-items-sm-center gap-2">
+                            <div>
+                                <h6 class="mb-1 fw-bold fs-6" data-i18n="purge_all">清空所有数据</h6>
+                            </div>
+                            <button onclick="cleanHistory(0)" class="btn btn-sm btn-outline-danger rounded-pill px-4 fw-bold" data-i18n="purge">清空</button>
                         </div>
                     </div>
                 </div>
@@ -769,13 +789,12 @@ function getAdminHtml() {
         </div>
     </div>
 
-    <div class="modal fade" id="serverModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content border-0 shadow-lg rounded-4 p-2"><div class="modal-header border-0"><h5 class="modal-title fw-bold" id="srvModalTitle">TCP Monitor</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><form id="serverForm"><input type="hidden" id="srvId"><div class="mb-4"><label class="form-label small text-muted fw-bold text-uppercase">Monitor Name</label><input type="text" class="form-control form-control-lg bg-light-subtle border-0 rounded-3" id="srvName" required></div><div class="row g-3"><div class="col-8 mb-3"><label class="form-label small text-muted fw-bold text-uppercase">Host / IP</label><input type="text" class="form-control form-control-lg bg-light-subtle border-0 rounded-3" id="srvHost" placeholder="Host or IP" required></div><div class="col-4 mb-3"><label class="form-label small text-muted fw-bold text-uppercase">Port</label><input type="number" class="form-control form-control-lg bg-light-subtle border-0 rounded-3" id="srvPort" value="22" required></div></div></form></div><div class="modal-footer border-0"><button type="button" class="btn btn-primary rounded-pill px-5 py-2 fw-bold w-100" onclick="saveServer()">Confirm & Save</button></div></div></div></div>
+    <!-- Modals -->
+    <div class="modal fade" id="serverModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content status-card-child p-2" style="--theme-hue: 59, 130, 246;"><div class="modal-header border-0"><h5 class="modal-title fw-bold" id="srvModalTitle">TCP Monitor</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><form id="serverForm"><input type="hidden" id="srvId"><div class="mb-4"><label class="form-label small text-muted fw-bold text-uppercase">Name</label><input type="text" class="form-control form-control-lg bg-light-subtle border-0 rounded-3" id="srvName" required></div><div class="row g-3"><div class="col-8 mb-3"><label class="form-label small text-muted fw-bold text-uppercase">Host / IP</label><input type="text" class="form-control form-control-lg bg-light-subtle border-0 rounded-3" id="srvHost" required></div><div class="col-4 mb-3"><label class="form-label small text-muted fw-bold text-uppercase">Port</label><input type="number" class="form-control form-control-lg bg-light-subtle border-0 rounded-3" id="srvPort" value="22" required></div></div></form></div><div class="modal-footer border-0"><button type="button" class="btn btn-primary rounded-pill px-5 py-2 fw-bold w-100" onclick="saveServer()">Save</button></div></div></div></div>
     
-    <div class="modal fade" id="siteModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content border-0 shadow-lg rounded-4 p-2"><div class="modal-header border-0"><h5 class="modal-title fw-bold" id="siteModalTitle">API / Web Monitor</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><form id="siteForm"><input type="hidden" id="siteId"><div class="mb-4"><label class="form-label small text-muted fw-bold text-uppercase">Monitor Name</label><input type="text" class="form-control form-control-lg bg-light-subtle border-0 rounded-3" id="siteName"></div><div class="mb-3"><label class="form-label small text-muted fw-bold text-uppercase">URL (http/https)</label><input type="url" class="form-control form-control-lg bg-light-subtle border-0 rounded-3" id="siteUrl" placeholder="https://" required></div><div class="mb-3"><label class="form-label small text-muted fw-bold text-uppercase">HTTP Method</label><select class="form-select bg-light-subtle border-0 rounded-3" id="siteMethod"><option value="HEAD">HEAD (Lightweight Ping)</option><option value="GET">GET</option><option value="POST">POST</option><option value="PUT">PUT</option></select></div><div class="mb-3"><label class="form-label small text-muted fw-bold text-uppercase">Headers (JSON format)</label><textarea class="form-control bg-light-subtle border-0 rounded-3" id="siteHeaders" placeholder='{"Authorization": "Bearer token"}' rows="2"></textarea></div><div class="mb-3"><label class="form-label small text-muted fw-bold text-uppercase">Request Body (optional)</label><textarea class="form-control bg-light-subtle border-0 rounded-3" id="siteBody" placeholder='{"key":"value"}' rows="2"></textarea></div></form></div><div class="modal-footer border-0"><button type="button" class="btn btn-success rounded-pill px-5 py-2 fw-bold w-100" onclick="saveSite()">Confirm & Save</button></div></div></div></div>
+    <div class="modal fade" id="siteModal" tabindex="-1"><div class="modal-dialog modal-dialog-centered"><div class="modal-content status-card-child p-2" style="--theme-hue: 16, 185, 129;"><div class="modal-header border-0"><h5 class="modal-title fw-bold" id="siteModalTitle">Web Monitor</h5><button type="button" class="btn-close" data-bs-dismiss="modal"></button></div><div class="modal-body"><form id="siteForm"><input type="hidden" id="siteId"><div class="mb-4"><label class="form-label small text-muted fw-bold text-uppercase">Name</label><input type="text" class="form-control form-control-lg bg-light-subtle border-0 rounded-3" id="siteName"></div><div class="mb-3"><label class="form-label small text-muted fw-bold text-uppercase">URL (http/https)</label><input type="url" class="form-control form-control-lg bg-light-subtle border-0 rounded-3" id="siteUrl" required></div><div class="mb-3"><label class="form-label small text-muted fw-bold text-uppercase">HTTP Method</label><select class="form-select bg-light-subtle border-0 rounded-3" id="siteMethod"><option value="HEAD">HEAD</option><option value="GET">GET</option><option value="POST">POST</option><option value="PUT">PUT</option></select></div><div class="mb-3"><label class="form-label small text-muted fw-bold text-uppercase">Headers (JSON format)</label><textarea class="form-control bg-light-subtle border-0 rounded-3" id="siteHeaders" rows="2"></textarea></div><div class="mb-3"><label class="form-label small text-muted fw-bold text-uppercase">Request Body</label><textarea class="form-control bg-light-subtle border-0 rounded-3" id="siteBody" rows="2"></textarea></div></form></div><div class="modal-footer border-0"><button type="button" class="btn btn-success rounded-pill px-5 py-2 fw-bold w-100" onclick="saveSite()">Save</button></div></div></div></div>
 
-    <footer class="footer py-4 mt-auto glass-footer">
-        <div class="container text-center"><span class="text-muted small fw-medium">Power by Allen &copy; 2026 &middot; Status Monitor</span></div>
-    </footer>
+    ${getFooterHtml()}
     <script src="/js/admin.js"></script>
 </body>
 </html>`;
@@ -784,98 +803,220 @@ function getAdminHtml() {
 function getStyleCss() {
   return `
 :root {
-    --bs-font-sans-serif: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, "Helvetica Neue", Arial, sans-serif;
-    --bs-body-bg: #f3f4f6;
-    --card-radius: 24px;
-    --glass-bg: rgba(255, 255, 255, 0.7);
+    --bs-font-sans-serif: 'Inter', ui-sans-serif, system-ui, -apple-system, sans-serif;
+    --bs-body-bg: #f4f7fb;
+    --parent-card-bg: #ffffff;
+    --child-card-bg: #ffffff;
+    --card-border: rgba(0, 0, 0, 0.05);
+    --parent-border: rgba(0, 0, 0, 0.06);
+    --bs-primary: #3b82f6; 
+    --bs-success: #10b981; 
+    --glow-color: rgba(59, 130, 246, 0.06);
+    --glow-opacity: 0.08; /* 卡片左上角光晕透明度 */
 }
 [data-bs-theme="dark"] {
-    --bs-body-bg: #030712;
-    --bs-card-bg: #111827;
-    --glass-bg: rgba(15, 23, 42, 0.7);
-    --bs-primary: #3b82f6;
-    --bs-success: #10b981;
+    --bs-body-bg: #0b0f19;
+    --parent-card-bg: #131722;
+    --child-card-bg: #1a1e2b;
+    --card-border: rgba(255, 255, 255, 0.04);
+    --parent-border: rgba(255, 255, 255, 0.08);
+    --glow-color: rgba(96, 165, 250, 0.12);
+    --glow-opacity: 0.15; /* 深色模式稍微亮一点 */
 }
-body { background-color: var(--bs-body-bg); transition: background-color 0.3s; font-family: var(--bs-font-sans-serif); }
 
-/* Layout width control for perfect alignment */
-@media (min-width: 992px) { .w-80 { padding-left: 8vw !important; padding-right: 8vw !important; } }
-@media (min-width: 1400px) { .w-80 { padding-left: 12vw !important; padding-right: 12vw !important; } }
+body { 
+    background-color: var(--bs-body-bg); 
+    color: #334155; 
+    transition: background-color 0.3s ease; 
+    font-family: var(--bs-font-sans-serif);
+    min-height: 100vh;
+}
+[data-bs-theme="dark"] body { color: #f1f5f9; }
 
-/* Hero Navbar */
+/* 背景顶部径向光晕 */
+.ambient-glow {
+    position: fixed;
+    top: 0; left: 0; right: 0;
+    height: 60vh;
+    background-image: radial-gradient(circle at 50% 0%, var(--glow-color), transparent 60%);
+    pointer-events: none;
+    z-index: 0;
+}
+
+/* JetBrains Mono 专属数字样式 */
+.num-font { font-family: 'JetBrains Mono', monospace; font-variant-numeric: tabular-nums; }
+
+/* 页面留白 */
+@media (min-width: 992px) { .w-80 { padding-left: 6vw !important; padding-right: 6vw !important; } }
+@media (min-width: 1400px) { .w-80 { padding-left: 10vw !important; padding-right: 10vw !important; } }
+
+/* 导航栏 */
 .custom-glass-nav {
-    background: linear-gradient(135deg, rgba(56, 189, 248, 0.8), rgba(99, 102, 241, 0.8)) !important;
-    backdrop-filter: saturate(200%) blur(24px);
-    -webkit-backdrop-filter: saturate(200%) blur(24px);
-    padding: 1.2rem 0;
-    box-shadow: 0 4px 30px rgba(0,0,0,0.1);
-    border-bottom: 1px solid rgba(255,255,255,0.2);
+    background: rgba(var(--bs-body-bg-rgb), 0.7) !important;
+    backdrop-filter: blur(20px);
+    -webkit-backdrop-filter: blur(20px);
+    padding: 1rem 0;
+    border-bottom: 1px solid var(--parent-border);
+    box-shadow: none;
 }
-[data-bs-theme="dark"] .custom-glass-nav {
-    background: linear-gradient(135deg, rgba(15, 23, 42, 0.8), rgba(30, 27, 75, 0.8)) !important;
-    border-bottom: 1px solid rgba(255,255,255,0.05);
+
+/* 控制栏卡片 (外观/语言) */
+.nav-control-card {
+    background-color: var(--parent-card-bg);
+    border: 1px solid var(--parent-border);
+    border-radius: 12px;
+    height: 38px;
+    transition: all 0.2s;
 }
-.tracking-tight { letter-spacing: -0.5px; }
+.nav-control-card:hover {
+    border-color: rgba(59, 130, 246, 0.3);
+}
+.nav-action-btn { width: 38px; justify-content: center; }
+.nav-action-btn:hover { color: var(--bs-primary) !important; }
 
-/* Buttons */
-.nav-action-btn { width: 38px; height: 38px; display: flex; align-items: center; justify-content: center; border-radius: 12px; background: rgba(255,255,255,0.15) !important; color: #fff !important; transition: all 0.2s; }
-.nav-action-btn:hover { background: rgba(255,255,255,0.3) !important; transform: scale(1.05); }
+/* ---------------- 大卡片 (Parent) ---------------- */
+.status-card-parent {
+    background: var(--parent-card-bg);
+    border: 1px solid var(--parent-border);
+    border-radius: 20px;
+    box-shadow: 0 4px 10px rgba(0, 0, 0, 0.02);
+}
+[data-bs-theme="dark"] .status-card-parent {
+    box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.2), inset 0 1px 0 rgba(255, 255, 255, 0.03);
+}
 
-/* Layout & Cards */
-.main-card { border-radius: var(--card-radius); background-color: var(--bs-card-bg); width: 100%; box-shadow: 0 20px 40px rgba(0,0,0,0.03) !important; }
-[data-bs-theme="dark"] .main-card { box-shadow: 0 20px 40px rgba(0,0,0,0.3) !important; border: 1px solid rgba(255,255,255,0.05) !important; }
-.bg-light-subtle { background-color: rgba(var(--bs-light-rgb), 0.5) !important; }
-[data-bs-theme="dark"] .bg-light-subtle { background-color: rgba(255,255,255,0.03) !important; }
+/* ---------------- 小卡片 (Child) ---------------- */
+.status-card-child {
+    /* 左上角氛围光晕，使用 CSS 变量动态调整颜色 */
+    background-image: radial-gradient(circle at 0% 0%, rgba(var(--theme-hue, 59, 130, 246), var(--glow-opacity)), transparent 70%);
+    background-color: var(--child-card-bg);
+    border: 1px solid var(--card-border);
+    border-radius: 16px;
+    position: relative;
+    transition: transform 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275), box-shadow 0.4s ease, border-color 0.4s ease;
+    overflow: hidden;
+    box-shadow: 0 2px 4px rgba(0, 0, 0, 0.02);
+}
+[data-bs-theme="dark"] .status-card-child { box-shadow: none; }
+.status-card-child:hover {
+    border-color: rgba(59, 130, 246, 0.2);
+    box-shadow: 0 10px 40px -10px var(--glow-color), 0 0 0 1px rgba(59, 130, 246, 0.05);
+    transform: translateY(-4px);
+}
+[data-bs-theme="dark"] .status-card-child:hover {
+    border-color: rgba(96, 165, 250, 0.2);
+    box-shadow: 0 10px 40px -10px var(--glow-color), 0 0 0 1px rgba(96, 165, 250, 0.1);
+}
 
-/* Tables - PERFECT ALIGNMENT */
+.bg-light-subtle { background-color: #f1f5f9 !important; }
+[data-bs-theme="dark"] .bg-light-subtle { background-color: rgba(255,255,255,0.02) !important; }
+
+/* Admin 表格在卡片内的适配 */
 .custom-table { width: 100%; margin-bottom: 0; table-layout: fixed; }
-.custom-table th { border-bottom: 1px solid rgba(0,0,0,0.05); font-weight: 600; text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.5px; color: var(--bs-secondary-color); padding: 1.5rem 0.5rem; }
-[data-bs-theme="dark"] .custom-table th { border-bottom-color: rgba(255,255,255,0.05); }
-.custom-table td { padding: 1.25rem 0.5rem; border-bottom: 1px solid rgba(0,0,0,0.02); vertical-align: middle; }
+.custom-table th { border-bottom: 1px solid var(--card-border); font-weight: 600; text-transform: uppercase; font-size: 0.75rem; letter-spacing: 0.05em; color: #64748b; padding: 1rem; }
+[data-bs-theme="dark"] .custom-table th { color: #94a3b8; }
+.custom-table td { padding: 1rem; border-bottom: 1px solid rgba(0,0,0,0.02); vertical-align: middle; }
 [data-bs-theme="dark"] .custom-table td { border-bottom-color: rgba(255,255,255,0.02); }
-.custom-table tbody tr { transition: background 0.2s; }
-.custom-table tbody tr:hover td { background-color: rgba(var(--bs-primary-rgb), 0.03); }
+.custom-table tbody tr:last-child td { border-bottom: none; }
+.custom-table tbody tr { transition: background 0.15s; }
+.custom-table tbody tr:hover td { background-color: rgba(0,0,0,0.02); }
+[data-bs-theme="dark"] .custom-table tbody tr:hover td { background-color: rgba(255, 255, 255, 0.02); }
 
-/* Drag & Drop */
-.drag-handle { cursor: grab; font-size: 1.2rem; opacity: 0.5; transition: opacity 0.2s; }
-.drag-handle:hover { opacity: 1; color: var(--bs-primary) !important; }
-.drag-handle:active { cursor: grabbing; }
+.drag-handle { cursor: grab; font-size: 1.2rem; color: #cbd5e1; transition: color 0.2s; }
+.drag-handle:hover { color: var(--bs-primary) !important; }
 
-/* Public Table Columns */
-.public-status-table th, .public-status-table td { text-align: center; }
-.public-status-table th:nth-child(1), .public-status-table td:nth-child(1) { width: 22%; text-align: left; padding-left: 1.5rem; }
-.public-status-table th:nth-child(2), .public-status-table td:nth-child(2) { width: 13%; }
-.public-status-table th:nth-child(3), .public-status-table td:nth-child(3) { width: 13%; }
-.public-status-table th:nth-child(4), .public-status-table td:nth-child(4) { width: 13%; }
-.public-status-table th:nth-child(5), .public-status-table td:nth-child(5) { width: 15%; }
-.public-status-table th:nth-child(6), .public-status-table td:nth-child(6) { width: 24%; }
-
-/* Admin Table Columns */
 .admin-status-table { min-width: 850px; }
 .admin-status-table th, .admin-status-table td { text-align: center; }
-.admin-status-table th:nth-child(1), .admin-status-table td:nth-child(1) { width: 5%; padding: 0; }
+.admin-status-table th:nth-child(1), .admin-status-table td:nth-child(1) { width: 5%; padding-left: 0; }
 .admin-status-table th:nth-child(2), .admin-status-table td:nth-child(2) { width: 20%; text-align: left; }
 .admin-status-table th:nth-child(3), .admin-status-table td:nth-child(3) { width: 30%; text-align: left; }
 .admin-status-table th:nth-child(4), .admin-status-table td:nth-child(4) { width: 15%; }
 .admin-status-table th:nth-child(5), .admin-status-table td:nth-child(5) { width: 15%; }
 .admin-status-table th:nth-child(6), .admin-status-table td:nth-child(6) { width: 15%; }
 
-/* Charts */
-.sparkline-container { width: 100%; min-width: 140px; max-width: 180px; height: 45px; display: inline-block; vertical-align: middle; }
+/* ---------------- 底部版权优化 ---------------- */
+.footer-border { border-color: var(--parent-border) !important; }
 
-/* Mobile Cards */
-.mobile-status-card { background: var(--bs-card-bg); border-radius: 16px; border: 1px solid rgba(0,0,0,0.05); padding: 1.25rem; margin-bottom: 1rem; box-shadow: 0 4px 12px rgba(0,0,0,0.02); }
-[data-bs-theme="dark"] .mobile-status-card { border-color: rgba(255,255,255,0.05); box-shadow: 0 4px 12px rgba(0,0,0,0.2); }
+@keyframes pulse-green {
+    0% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0.4); }
+    70% { box-shadow: 0 0 0 6px rgba(16, 185, 129, 0); }
+    100% { box-shadow: 0 0 0 0 rgba(16, 185, 129, 0); }
+}
+.status-indicator-pulse {
+    width: 8px; height: 8px; border-radius: 50%;
+    background-color: var(--bs-success);
+    animation: pulse-green 2s infinite;
+}
 
-/* Toasts */
+/* 通知吐司提示 */
 .toast-container { position: fixed; top: 20px; left: 50%; transform: translateX(-50%); z-index: 1055; display: flex; flex-direction: column; align-items: center; pointer-events: none; }
-.unified-toast { pointer-events: auto; padding: 12px 24px; margin-bottom: 10px; border-radius: 50px; font-weight: 600; font-size: 0.9rem; display: inline-flex; align-items: center; gap: 8px; box-shadow: 0 10px 30px rgba(0,0,0,0.15); animation: toastIn 0.4s cubic-bezier(0.175, 0.885, 0.32, 1.275); color: #fff; }
+.unified-toast { pointer-events: auto; padding: 10px 20px; margin-bottom: 10px; border-radius: 8px; font-weight: 500; font-size: 0.875rem; display: inline-flex; align-items: center; gap: 8px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.1); animation: toastIn 0.3s ease-out; color: #fff; }
 .unified-toast.success { background: #10b981; }
 .unified-toast.danger { background: #ef4444; }
-.unified-toast.warning { background: #f59e0b; color: #000; }
-@keyframes toastIn { from { opacity: 0; transform: translateY(-20px) scale(0.9); } to { opacity: 1; transform: translateY(0) scale(1); } }
+.unified-toast.warning { background: #f59e0b; color: #fff; }
+@keyframes toastIn { from { opacity: 0; transform: translateY(-10px); } to { opacity: 1; transform: translateY(0); } }
 .hiding { animation: toastOut 0.2s ease forwards; }
-@keyframes toastOut { from { opacity: 1; transform: scale(1); } to { opacity: 0; transform: scale(0.9); } }
+@keyframes toastOut { from { opacity: 1; } to { opacity: 0; } }
+`;
+}
+
+function getSharedJs() {
+  return `
+const I18N_DICT = {
+    zh: {
+        services: "服务状态", websites: "网站访问", connecting: "正在连接...", no_data: "暂无配置监控项目",
+        uptime: "连通率", latency: "延迟", updated_at: "更新于", waiting_data: "等待数据...",
+        theme: "外观", theme_auto: "自动", theme_light: "浅色", theme_dark: "深色",
+        lang: "语言", all_ok: "所有系统运行正常", admin_login: "管理员登录", 
+        username: "用户名", pwd: "密码", login_btn: "进入控制面板",
+        add_target: "添加", add_site: "添加", th_name: "名称", host_port: "地址:端口",
+        status: "状态", public: "公开展示", action: "操作",
+        bark_title: "Bark 推送通知", bark_url: "Bark API 地址", enable_push: "启用实时推送",
+        save_settings: "保存设置", test_push: "测试推送",
+        data_maint: "数据维护", db_desc: "优化数据库以保持监控快速运行，并避免超出 Cloudflare D1 限制。",
+        clear_24h: "清理 24h 前日志", purge_all: "清空所有数据", clean: "清理", purge: "清空",
+        unnamed: "未命名", peak_latency: "峰值延迟", no_record: "暂无数据记录",
+        st_up: "正常", st_down: "宕机", st_timeout: "超时", st_pending: "等待中"
+    },
+    en: {
+        services: "Services", websites: "Websites", connecting: "Connecting...", no_data: "No monitors configured",
+        uptime: "Uptime", latency: "Latency", updated_at: "Updated at", waiting_data: "Waiting...",
+        theme: "Theme", theme_auto: "Auto", theme_light: "Light", theme_dark: "Dark",
+        lang: "Language", all_ok: "All Systems Operational", admin_login: "Admin Login", 
+        username: "Username", pwd: "Password", login_btn: "Access Dashboard",
+        add_target: "Add", add_site: "Add", th_name: "Name", host_port: "Host:Port",
+        status: "Status", public: "Public", action: "Action",
+        bark_title: "Bark Push Notify", bark_url: "Bark API URL", enable_push: "Enable Real-time Push",
+        save_settings: "Save Settings", test_push: "Test Push",
+        data_maint: "Data Maintenance", db_desc: "Optimizing the database keeps your monitor running fast and within limits.",
+        clear_24h: "Clear old logs (>24h)", purge_all: "Purge All Logs", clean: "Clean", purge: "Purge",
+        unnamed: "Unnamed", peak_latency: "Peak Latency", no_record: "No Data",
+        st_up: "UP", st_down: "DOWN", st_timeout: "TIMEOUT", st_pending: "PENDING"
+    }
+};
+
+let currentLang = localStorage.getItem('vps-lang') || 'zh';
+
+function t(key) { return I18N_DICT[currentLang]?.[key] || key; }
+
+function updateStaticI18n() {
+    document.querySelectorAll('[data-i18n]').forEach(el => { el.textContent = t(el.getAttribute('data-i18n')); });
+    document.querySelectorAll('[data-i18n-placeholder]').forEach(el => { el.placeholder = t(el.getAttribute('data-i18n-placeholder')); });
+}
+
+function initLangControl() {
+    const sel = document.getElementById('langSelect');
+    if(!sel) return;
+    sel.value = currentLang;
+    sel.addEventListener('change', (e) => {
+        currentLang = e.target.value;
+        localStorage.setItem('vps-lang', currentLang);
+        updateStaticI18n();
+        if (typeof redrawCharts === 'function') redrawCharts();
+        if (typeof loadAdminData === 'function') loadAdminData();
+    });
+    updateStaticI18n();
+}
 `;
 }
 
@@ -885,10 +1026,14 @@ function getMainJs() {
 const API_URL = '/api/status/all';
 let echartInstances = [];
 
+// 定制光晕色卡表：紫色、绿色、蓝色、橙色、青色、粉色
+const HUE_PALETTE = ['168, 85, 247', '16, 185, 129', '59, 130, 246', '249, 115, 22', '6, 182, 212', '236, 72, 153'];
+
 document.addEventListener('DOMContentLoaded', () => {
-    initTheme();
+    initLangControl();
+    initThemeControl();
     checkAdminStatus();
-    if(document.getElementById('serverTableBody')){
+    if(document.getElementById('serverGrid')){
         loadData();
         setInterval(loadData, 60000);
     }
@@ -899,23 +1044,43 @@ document.addEventListener('DOMContentLoaded', () => {
     }
 });
 
-function initTheme() {
-    const t = document.getElementById('themeToggler');
-    if(t) t.addEventListener('click', () => {
-        const nt = document.documentElement.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark';
-        document.documentElement.setAttribute('data-bs-theme', nt);
-        localStorage.setItem('vps-monitor-theme', nt);
-        echartInstances.forEach(i => i.dispose());
-        echartInstances = [];
-        loadData();
+function initThemeControl() {
+    const sel = document.getElementById('themeSelect');
+    if(!sel) return;
+    sel.value = localStorage.getItem('vps-monitor-theme') || 'auto';
+    sel.addEventListener('change', (e) => {
+        const tm = e.target.value;
+        localStorage.setItem('vps-monitor-theme', tm);
+        applyTheme(tm);
     });
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {
+        if(localStorage.getItem('vps-monitor-theme') === 'auto' || !localStorage.getItem('vps-monitor-theme')) {
+            document.documentElement.setAttribute('data-bs-theme', e.matches ? 'dark' : 'light');
+            redrawCharts();
+        }
+    });
+}
+
+function applyTheme(themeMode) {
+    let actualTheme = themeMode;
+    if (themeMode === 'auto') {
+        actualTheme = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+    }
+    document.documentElement.setAttribute('data-bs-theme', actualTheme);
+    redrawCharts();
+}
+
+function redrawCharts() {
+    echartInstances.forEach(i => i.dispose());
+    echartInstances = [];
+    if(document.getElementById('serverGrid')) loadData();
 }
 
 function showToast(type, msg) {
     const c = document.getElementById('toastContainer'); if (!c) return;
-    const t = document.createElement('div'); t.className = 'unified-toast ' + type;
-    t.innerHTML = \`<div>\${msg}</div>\`;
-    c.appendChild(t); setTimeout(() => { t.classList.add('hiding'); setTimeout(()=>t.remove(), 200); }, 3000);
+    const toast = document.createElement('div'); toast.className = 'unified-toast ' + type;
+    toast.innerHTML = \`<div>\${msg}</div>\`;
+    c.appendChild(toast); setTimeout(() => { toast.classList.add('hiding'); setTimeout(()=>toast.remove(), 200); }, 3000);
 }
 
 async function checkAdminStatus() {
@@ -924,15 +1089,15 @@ async function checkAdminStatus() {
     try {
         const r = await fetch('/api/auth/status', { headers: { 'Authorization': 'Bearer ' + token } });
         const d = await r.json();
-        if(d.authenticated && document.getElementById('serverTableBody')) {
+        if(d.authenticated && document.getElementById('serverGrid')) {
             const navGroup = document.getElementById('navButtonGroup');
             if(navGroup && !document.getElementById('adminEntryBtn')) {
                 const a = document.createElement('a');
                 a.id = 'adminEntryBtn';
-                a.className = 'btn nav-action-btn border-0 text-decoration-none ms-1';
+                a.className = 'nav-control-card d-flex align-items-center px-3 text-decoration-none me-2';
                 a.href = '/admin.html';
-                a.title = 'Enter Dashboard';
-                a.innerHTML = '<i class="bi bi-speedometer2 fs-5"></i>';
+                a.title = 'Dashboard';
+                a.innerHTML = '<i class="fa-solid fa-gauge text-primary"></i>';
                 navGroup.insertBefore(a, navGroup.firstChild);
             }
         }
@@ -952,14 +1117,14 @@ async function checkLoginRedirect() {
 async function handleLogin(e) {
     e.preventDefault();
     const u = document.getElementById('username').value, p = document.getElementById('password').value, b=e.target.querySelector('button');
-    b.disabled=true; b.textContent='Verifying...';
+    b.disabled=true; b.textContent='...';
     try {
         const r = await fetch('/api/auth/login', { method:'POST', body:JSON.stringify({username:u,password:p}) });
         const d = await r.json();
         if(!r.ok) throw new Error(d.message);
         localStorage.setItem('auth_token', d.token); 
         window.location.replace('/admin.html');
-    } catch(err) { showToast('danger', err.message); b.disabled=false; b.textContent='Access Dashboard'; }
+    } catch(err) { showToast('danger', err.message); b.disabled=false; b.textContent=t('login_btn'); }
 }
 
 async function loadData() {
@@ -967,18 +1132,19 @@ async function loadData() {
         const r = await fetch(API_URL, { headers: { 'Authorization': 'Bearer ' + (localStorage.getItem('auth_token')||'') } });
         const d = await r.json();
         
-        renderTable('serverTableBody', d.servers, 'TCP');
-        renderTable('siteStatusTableBody', d.sites, 'HTTP');
-        
-        renderMobileCards('mobileServerContainer', d.servers, 'TCP');
-        renderMobileCards('mobileSiteContainer', d.sites, 'HTTP');
+        renderCards('serverGrid', d.servers, 'TCP');
+        renderCards('siteGrid', d.sites, 'HTTP');
     } catch(e) {}
 }
 
 function getStatusUI(status) {
-    const m = { 'UP': {c:'text-success', i:'bi-check-circle-fill'}, 'DOWN': {c:'text-danger', i:'bi-x-circle-fill'}, 'TIMEOUT': {c:'text-warning', i:'bi-exclamation-circle-fill'} };
-    const s = m[status] || {c:'text-secondary', i:'bi-question-circle-fill'};
-    return \`<span class="\${s.c} fw-bold"><i class="bi \${s.i} me-1"></i>\${status}</span>\`;
+    const m = { 
+        'UP': {c:'text-success', i:'fa-circle-check', k:'st_up'}, 
+        'DOWN': {c:'text-danger', i:'fa-circle-xmark', k:'st_down'}, 
+        'TIMEOUT': {c:'text-warning', i:'fa-circle-exclamation', k:'st_timeout'} 
+    };
+    const s = m[status] || {c:'text-secondary', i:'fa-circle-question', k:'st_pending'};
+    return \`<span class="\${s.c} fw-bold"><i class="fa-solid \${s.i} me-1"></i>\${t(s.k)}</span>\`;
 }
 
 function calcUptime(history) {
@@ -987,52 +1153,35 @@ function calcUptime(history) {
     return ((up / history.length) * 100).toFixed(2) + '%';
 }
 
-function renderTable(tbodyId, items, type) {
-    const tb = document.getElementById(tbodyId); if(!tb) return;
-    tb.innerHTML = '';
-    if(!items || items.length === 0) { tb.innerHTML = \`<tr><td colspan="6" class="text-center py-5 text-muted">No \${type} target configured.</td></tr>\`; return; }
-    
-    items.forEach((item, index) => {
-        const tr = document.createElement('tr');
-        const st = item.last_status || 'PENDING';
-        const lat = item.last_response_time_ms ? \`<span class="fw-bold \${item.last_response_time_ms>500?'text-warning':'text-body'}">\${item.last_response_time_ms}ms</span>\` : '-';
-        const time = item.last_checked ? new Date(item.last_checked*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : '-';
-        const chartId = \`chart-\${type}-\${index}\`;
-        
-        tr.innerHTML = \`
-            <td class="fw-bold text-truncate" style="max-width: 200px;" title="\${item.name || item.url || item.host}">\${item.name || item.url || item.host}</td>
-            <td>\${getStatusUI(st)}</td>
-            <td class="fw-semibold text-muted">\${calcUptime(item.history)}</td>
-            <td>\${lat}</td>
-            <td class="text-muted small">\${time}</td>
-            <td><div id="\${chartId}" class="sparkline-container"></div></td>
-        \`;
-        tb.appendChild(tr);
-        if(item.history) renderSparkline(chartId, item.history);
-    });
-}
-
-function renderMobileCards(containerId, items, type) {
+function renderCards(containerId, items, type) {
     const c = document.getElementById(containerId); if(!c) return;
     c.innerHTML = '';
-    if(!items || items.length === 0) { c.innerHTML = \`<div class="text-center py-4 text-muted">No \${type} target configured.</div>\`; return; }
+    if(!items || items.length === 0) { c.innerHTML = \`<div class="col-12 text-center py-5 text-muted">\${t('no_data')}</div>\`; return; }
     
     items.forEach((item, index) => {
         const div = document.createElement('div');
-        div.className = 'mobile-status-card';
+        div.className = 'col';
         const st = item.last_status || 'PENDING';
-        const chartId = \`mobile-chart-\${type}-\${index}\`;
+        const lat = item.last_response_time_ms ? \`<span class="fw-bold num-font \${item.last_response_time_ms>500?'text-warning':'text-body'}">\${item.last_response_time_ms}ms</span>\` : '-';
+        const time = item.last_checked ? new Date(item.last_checked*1000).toLocaleTimeString([], {hour:'2-digit',minute:'2-digit'}) : t('waiting_data');
+        const chartId = \`chart-\${type}-\${index}\`;
+        
+        // 动态分配光晕颜色
+        const themeHue = HUE_PALETTE[index % HUE_PALETTE.length];
         
         div.innerHTML = \`
-            <div class="d-flex justify-content-between align-items-center mb-3">
-                <div class="fw-bold fs-5 text-truncate pe-3">\${item.name || item.url || item.host}</div>
-                <div>\${getStatusUI(st)}</div>
+            <div class="status-card-child p-3 p-md-4 h-100 d-flex flex-column" style="--theme-hue: \${themeHue};">
+                <div class="d-flex justify-content-between align-items-center mb-3">
+                    <h6 class="mb-0 fw-bold text-truncate pe-2" title="\${item.name || item.url || item.host}">\${item.name || item.url || item.host}</h6>
+                    \${getStatusUI(st)}
+                </div>
+                <div class="d-flex justify-content-between text-muted small mb-3 flex-grow-1">
+                    <div>\${t('uptime')}: <span class="fw-bold text-body num-font">\${calcUptime(item.history)}</span></div>
+                    <div>\${t('latency')}: \${lat}</div>
+                </div>
+                <div id="\${chartId}" class="w-100" style="height: 60px;"></div>
+                <div class="mt-3 text-end text-muted opacity-75 num-font" style="font-size: 0.7rem;">\${t('updated_at')} \${time}</div>
             </div>
-            <div class="d-flex justify-content-between text-muted small mb-3">
-                <div>Uptime: <span class="fw-bold text-body">\${calcUptime(item.history)}</span></div>
-                <div>Ping: <span class="fw-bold \${item.last_response_time_ms>500?'text-warning':'text-body'}">\${item.last_response_time_ms||'-'}ms</span></div>
-            </div>
-            <div id="\${chartId}" style="width:100%; height:45px;"></div>
         \`;
         c.appendChild(div);
         if(item.history) renderSparkline(chartId, item.history);
@@ -1081,44 +1230,51 @@ function renderSparkline(elementId, history) {
         tooltip: {
             trigger: 'axis',
             axisPointer: { type: 'none' },
-            backgroundColor: isDark ? 'rgba(31, 41, 55, 0.95)' : 'rgba(255, 255, 255, 0.95)',
-            borderColor: isDark ? '#374151' : '#e5e7eb',
-            textStyle: { color: isDark ? '#f9fafb' : '#111827', fontSize: 12, fontFamily: 'Inter, sans-serif' },
+            backgroundColor: isDark ? 'rgba(19, 23, 34, 0.95)' : 'rgba(255, 255, 255, 0.95)',
+            borderColor: isDark ? '#334155' : '#e2e8f0',
+            textStyle: { color: isDark ? '#f8fafc' : '#0f172a', fontSize: 12, fontFamily: 'Inter, sans-serif' },
             padding: [8, 12],
             formatter: (params) => {
                 const d = params[0].data;
-                if(d.status === 'NODATA') return \`<div class="small fw-bold text-muted">\${d.name}</div><div class="small">No Data recorded</div>\`;
+                if(!d) return '';
+                if(d.status === 'NODATA') return \`<div class="small fw-bold text-muted">\${d.name}</div><div class="small">\${t('no_record')}</div>\`;
                 const c = d.status==='UP' ? '#10b981' : (d.status==='DOWN'?'#ef4444':'#f59e0b');
-                return \`<div class="fw-bold mb-1" style="font-size:11px;color:#6b7280;">\${d.name}</div>
+                return \`<div class="fw-bold mb-1" style="font-size:11px;color:#64748b;">\${d.name}</div>
                         <div class="d-flex align-items-center gap-2 mb-1">
                             <div style="width:8px;height:8px;border-radius:50%;background-color:\${c}"></div>
                             <span class="fw-bold" style="color:\${c}">\${d.status}</span>
                         </div>
-                        <div class="small fw-medium">Max Latency: \${d.latency} ms</div>\`;
+                        <div class="small fw-medium num-font">\${t('peak_latency')}: \${d.latency} ms</div>\`;
             }
         },
-        grid: { left: 0, right: 0, top: 5, bottom: 2 },
-        xAxis: { type: 'time', show: false, boundaryGap: true },
-        yAxis: { type: 'value', show: false, min: 0, max: yAxisMax },
-        series: [{
-            type: 'bar',
-            data: data,
-            barWidth: '70%',
-            showBackground: true, 
-            backgroundStyle: {
-                color: isDark ? 'rgba(255, 255, 255, 0.1)' : 'rgba(0, 0, 0, 0.05)',
-                borderRadius: [3, 3, 3, 3]
-            },
-            itemStyle: {
-                color: (params) => {
-                    if(params.data.status === 'UP') return '#10b981';
-                    if(params.data.status === 'DOWN' || params.data.status === 'ERROR') return '#ef4444';
-                    if(params.data.status === 'NODATA') return 'transparent';
-                    return '#f59e0b';
+        grid: { left: 0, right: 0, top: 5, bottom: 0 },
+        xAxis: { type: 'time', show: false, boundaryGap: false },
+        yAxis: { type: 'value', show: false, min: 0 },
+        series: [
+            {
+                type: 'line',
+                data: data,
+                smooth: 0.4,
+                showSymbol: false,
+                lineStyle: {
+                    width: 2,
+                    color: isDark ? '#34d399' : '#10b981'
                 },
-                borderRadius: [3, 3, 3, 3]
+                areaStyle: {
+                    color: new echarts.graphic.LinearGradient(0, 0, 0, 1, [
+                        { offset: 0, color: isDark ? 'rgba(52, 211, 153, 0.3)' : 'rgba(16, 185, 129, 0.25)' },
+                        { offset: 1, color: isDark ? 'rgba(52, 211, 153, 0)' : 'rgba(16, 185, 129, 0)' }
+                    ])
+                }
+            },
+            {
+                type: 'scatter',
+                data: data.map(d => (d.status === 'DOWN' || d.status === 'ERROR' || d.status === 'TIMEOUT') ? d : null).filter(Boolean),
+                itemStyle: { color: '#ef4444' },
+                symbolSize: 6,
+                zlevel: 1
             }
-        }]
+        ]
     });
 }
 
@@ -1135,19 +1291,32 @@ let adminSites = [];
 
 document.addEventListener('DOMContentLoaded', () => {
     if(!localStorage.getItem('auth_token')) { window.location.replace('/'); return; }
-    initTheme();
+    initLangControl();
+    initThemeControl();
     loadAdminData();
     initDragDrop('adminServerTableBody', 'servers');
     initDragDrop('adminSiteTableBody', 'sites');
     document.getElementById('logoutBtn').addEventListener('click', () => { localStorage.removeItem('auth_token'); window.location.replace('/'); });
 });
 
-function initTheme() {
-    const t = document.getElementById('themeToggler');
-    if(t) t.addEventListener('click', () => {
-        const nt = document.documentElement.getAttribute('data-bs-theme') === 'dark' ? 'light' : 'dark';
-        document.documentElement.setAttribute('data-bs-theme', nt);
-        localStorage.setItem('vps-monitor-theme', nt);
+function initThemeControl() {
+    const sel = document.getElementById('themeSelect');
+    if(!sel) return;
+    sel.value = localStorage.getItem('vps-monitor-theme') || 'auto';
+    sel.addEventListener('change', (e) => {
+        const tm = e.target.value;
+        localStorage.setItem('vps-monitor-theme', tm);
+        let actual = tm;
+        if(tm === 'auto') {
+            actual = window.matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light';
+        }
+        document.documentElement.setAttribute('data-bs-theme', actual);
+    });
+
+    window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', e => {
+        if(localStorage.getItem('vps-monitor-theme') === 'auto' || !localStorage.getItem('vps-monitor-theme')) {
+            document.documentElement.setAttribute('data-bs-theme', e.matches ? 'dark' : 'light');
+        }
     });
 }
 
@@ -1162,9 +1331,9 @@ async function apiCall(endpoint, options={}) {
 
 function showToast(type, msg) {
     const c = document.getElementById('toastContainer'); if (!c) return;
-    const t = document.createElement('div'); t.className = 'unified-toast ' + type;
-    t.innerHTML = \`<div>\${msg}</div>\`;
-    c.appendChild(t); setTimeout(() => { t.classList.add('hiding'); setTimeout(()=>t.remove(), 200); }, 3000);
+    const toast = document.createElement('div'); toast.className = 'unified-toast ' + type;
+    toast.innerHTML = \`<div>\${msg}</div>\`;
+    c.appendChild(toast); setTimeout(() => { toast.classList.add('hiding'); setTimeout(()=>toast.remove(), 200); }, 3000);
 }
 
 async function loadAdminData() {
@@ -1183,12 +1352,12 @@ async function loadAdminData() {
 
 function renderAdminTable(tbodyId, items, type) {
     const tb = document.getElementById(tbodyId); tb.innerHTML = '';
-    if(!items.length) { tb.innerHTML = \`<tr><td colspan="6" class="text-center py-5 text-muted">No data configured.</td></tr>\`; return; }
+    if(!items.length) { tb.innerHTML = \`<tr><td colspan="6" class="text-center py-5 text-muted">\${t('no_data')}</td></tr>\`; return; }
     
     items.forEach(item => {
         let identifier = '';
         if(type === 'servers') {
-            identifier = \`<span class="text-muted">\${item.host}:\${item.port}</span>\`;
+            identifier = \`<span class="text-muted num-font">\${item.host}:\${item.port}</span>\`;
         } else {
             let badge = '';
             if(item.method && item.method !== 'HEAD') badge = \`<span class="badge bg-secondary me-2">\${item.method}</span>\`;
@@ -1201,8 +1370,8 @@ function renderAdminTable(tbodyId, items, type) {
         const isPub = item.is_public == 1;
         
         tr.innerHTML = \`
-            <td class="drag-handle text-muted fs-5"><i class="bi bi-grip-vertical"></i></td>
-            <td class="fw-bold">\${item.name || 'Unnamed'}</td>
+            <td class="drag-handle text-muted fs-5"><i class="fa-solid fa-grip-vertical"></i></td>
+            <td class="fw-bold">\${item.name || t('unnamed')}</td>
             <td>\${identifier}</td>
             <td><span class="badge \${item.last_status==='UP'?'bg-success':'bg-danger'}">\${item.last_status||'PENDING'}</span></td>
             <td>
@@ -1211,8 +1380,8 @@ function renderAdminTable(tbodyId, items, type) {
                 </div>
             </td>
             <td>
-                <button class="btn btn-sm btn-light border text-primary me-2 px-3" onclick="edit('\${type}', '\${item.id}')"><i class="bi bi-pencil"></i></button>
-                <button class="btn btn-sm btn-light border text-danger px-3" onclick="del('\${type}', '\${item.id}')"><i class="bi bi-trash"></i></button>
+                <button class="btn btn-sm btn-light border text-primary me-2 px-3" onclick="edit('\${type}', '\${item.id}')"><i class="fa-solid fa-pen"></i></button>
+                <button class="btn btn-sm btn-light border text-danger px-3" onclick="del('\${type}', '\${item.id}')"><i class="fa-solid fa-trash"></i></button>
             </td>
         \`;
         tb.appendChild(tr);
@@ -1248,9 +1417,9 @@ function initDragDrop(tbodyId, type) {
         const ids = Array.from(tbody.querySelectorAll('tr')).map(tr => tr.dataset.id);
         try {
             await apiCall(\`/\${type}/batch-reorder\`, {method: 'POST', body: JSON.stringify({ids})});
-            showToast('success', '排序已保存');
+            showToast('success', 'Order Saved');
         } catch(err) {
-            showToast('danger', '排序保存失败');
+            showToast('danger', 'Failed');
         }
     });
 }
@@ -1314,7 +1483,7 @@ window.saveSite = async () => {
 }
 
 window.del = async (type, id) => {
-    if(!confirm('Are you sure you want to delete this target?')) return;
+    if(!confirm('Delete?')) return;
     try { await apiCall(\`/\${type}/\${id}\`, {method:'DELETE'}); showToast('success', 'Deleted'); loadAdminData(); } catch(e){showToast('danger',e.message);}
 }
 
@@ -1323,7 +1492,7 @@ window.toggleVis = async (type, id, val) => {
 }
 
 window.saveBark = async () => {
-    try { await apiCall('/bark-settings', {method:'POST', body:JSON.stringify({bark_url: document.getElementById('barkUrl').value, enable_notifications: document.getElementById('enableBark').checked})}); showToast('success', 'Bark config saved'); } catch(e){showToast('danger',e.message);}
+    try { await apiCall('/bark-settings', {method:'POST', body:JSON.stringify({bark_url: document.getElementById('barkUrl').value, enable_notifications: document.getElementById('enableBark').checked})}); showToast('success', 'Saved'); } catch(e){showToast('danger',e.message);}
 }
 
 window.testBark = async () => {
@@ -1338,7 +1507,7 @@ window.testBark = async () => {
 }
 
 window.cleanHistory = async (hours) => {
-    if(!confirm(\`Are you sure you want to \${hours===0?'PURGE ALL records and reset status':'CLEAR records older than 24h'}?\`)) return;
+    if(!confirm('Are you sure?')) return;
     try {
         await apiCall('/maintenance/clear', { method: 'POST', body: JSON.stringify({ hours }) });
         showToast('success', 'Database maintenance complete');
@@ -1357,20 +1526,21 @@ function getMissingDbHtml() {
     <title>Action Required - Status Monitor</title>
     <link rel="preconnect" href="https://fonts.googleapis.com">
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&display=swap" rel="stylesheet">
+    <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" rel="stylesheet">
     <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.2/dist/css/bootstrap.min.css" rel="stylesheet">
-    <link href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.11.1/font/bootstrap-icons.css" rel="stylesheet">
     <style>
-        body { background-color: #030712; color: #f3f4f6; font-family: 'Inter', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
-        .glass-card { background: rgba(17, 24, 39, 0.7); backdrop-filter: blur(20px); border: 1px solid rgba(255,255,255,0.05); border-radius: 24px; box-shadow: 0 25px 50px -12px rgba(0, 0, 0, 0.5); padding: 3rem; max-width: 600px; width: 90%; }
-        .step-box { background: rgba(255,255,255,0.03); border: 1px solid rgba(255,255,255,0.05); border-radius: 12px; padding: 1.5rem; margin-top: 1.5rem; }
+        body { background-color: #0b0f19; color: #f3f4f6; font-family: 'Inter', sans-serif; display: flex; align-items: center; justify-content: center; min-height: 100vh; margin: 0; }
+        .glass-card { background: #131722; border: 1px solid rgba(255,255,255,0.08); border-radius: 20px; box-shadow: 0 10px 15px -3px rgba(0, 0, 0, 0.3); padding: 3rem; max-width: 600px; width: 90%; }
+        .step-box { background: rgba(255,255,255,0.02); border: 1px solid rgba(255,255,255,0.05); border-radius: 12px; padding: 1.5rem; margin-top: 1.5rem; }
         .step-number { background: #3b82f6; color: white; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center; font-size: 0.8rem; font-weight: bold; margin-right: 10px; }
         .code-block { background: #000; color: #10b981; padding: 4px 8px; border-radius: 6px; font-family: monospace; font-size: 0.9rem; }
     </style>
 </head>
 <body>
-    <div class="glass-card">
+    <div class="ambient-glow" style="position:fixed; top:0; left:0; right:0; height:60vh; background-image: radial-gradient(circle at 50% 0%, rgba(96, 165, 250, 0.12), transparent 60%); pointer-events: none;"></div>
+    <div class="glass-card position-relative z-1">
         <div class="text-center mb-4">
-            <i class="bi bi-database-exclamation text-warning" style="font-size: 4rem;"></i>
+            <i class="fa-solid fa-database text-warning" style="font-size: 4rem;"></i>
             <h2 class="fw-bold mt-3">Action Required</h2>
             <p class="text-muted">Status Monitor is running, but the D1 Database is not bound.</p>
         </div>
@@ -1390,7 +1560,7 @@ function getMissingDbHtml() {
                 <div>添加一个 D1 数据库绑定：<br>变量名称必须严格填写为 <span class="code-block">DB</span><br>然后选择你创建好的 D1 数据库。</div>
             </div>
             <div class="d-flex align-items-start">
-                <span class="step-number"><i class="bi bi-check2"></i></span>
+                <span class="step-number"><i class="fa-solid fa-check"></i></span>
                 <div class="text-success fw-bold">完成绑定后，重新刷新本页面即可，系统会自动初始化建表，无需其他任何操作！</div>
             </div>
         </div>
