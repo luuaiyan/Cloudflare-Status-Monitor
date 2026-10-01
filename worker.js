@@ -1450,11 +1450,12 @@ window.edit = (type, id) => {
 
 window.saveServer = async () => {
     const n=document.getElementById('srvName').value;
-    let h=document.getElementById('srvHost').value;
+    let h=document.getElementById('srvHost').value.trim();
     const p=document.getElementById('srvPort').value;
     if(!n||!h) return showToast('warning', 'Fill required fields');
     
-    h = h.replace(/^https?:\\/\\//, '').split('/')[0];
+    // 使用双反斜杠转义
+    h = h.replace(/^https?:\\/\\//i, '').split('/')[0];
     
     try { 
         await apiCall('/servers'+(editId?'/'+editId:''), {method:editId?'PUT':'POST', body:JSON.stringify({name:n, host:h, port:p})}); 
@@ -1466,12 +1467,16 @@ window.saveServer = async () => {
 
 window.saveSite = async () => {
     const n=document.getElementById('siteName').value;
-    const u=document.getElementById('siteUrl').value;
+    let u=document.getElementById('siteUrl').value.trim();
     const method=document.getElementById('siteMethod').value;
     const headers=document.getElementById('siteHeaders').value.trim();
     const body=document.getElementById('siteBody').value.trim();
 
     if(!u) return showToast('warning', 'URL required');
+    
+    // 使用双反斜杠转义，修复语法崩溃问题
+    if(!/^https?:\\/\\//i.test(u)) u = 'https://' + u;
+
     if(headers) { try { JSON.parse(headers); } catch(e) { return showToast('warning', 'Headers must be valid JSON'); } }
 
     try { 
